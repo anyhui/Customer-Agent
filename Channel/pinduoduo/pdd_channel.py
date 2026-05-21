@@ -81,6 +81,7 @@ class PDDChannel(ConnectionMixin, MessageHandlerMixin, LifecycleMixin, StatusMix
         self.heartbeat_config = HeartbeatConfig()
         self._reconnect_tasks: Dict[str, asyncio.Task] = {}
         self._heartbeat_tasks: Dict[str, asyncio.Task] = {}
+        self._health_tasks: Dict[str, asyncio.Task] = {}  # cookie 健康检查任务
 
         # 性能优化：并发控制和任务管理
         self.max_concurrent_messages = max_concurrent_messages

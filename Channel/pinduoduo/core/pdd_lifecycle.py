@@ -87,6 +87,21 @@ class LifecycleMixin:
                 del self._heartbeat_tasks[connection_key]
                 self.logger.debug(f"已清理心跳任务: {connection_key}")
 
+            if connection_key in self._health_tasks:
+                task = self._health_tasks[connection_key]
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=3.0)
+                    except asyncio.CancelledError:
+                        self.logger.debug(f"Cookie健康检查任务已被取消: {connection_key}")
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Cookie健康检查任务取消超时: {connection_key}")
+                    except Exception as task_error:
+                        self.logger.error(f"等待Cookie健康检查任务完成时出错: {task_error}")
+                del self._health_tasks[connection_key]
+                self.logger.debug(f"已清理Cookie健康检查任务: {connection_key}")
+
             self.status_manager.update_status(shop_id, user_id, username, ConnectionState.DISCONNECTED)
 
             if self.ws:
@@ -161,6 +176,15 @@ class LifecycleMixin:
                     self._heartbeat_tasks[connection_key] = heartbeat_task
                     self.logger.debug(f"心跳检查已启动: {shop_id}-{username}")
 
+                health_task = None
+                if self.heartbeat_config.enable_cookie_health_check:
+                    connection_key = f"{shop_id}_{user_id}"
+                    health_task = asyncio.create_task(
+                        self._cookie_health_loop(shop_id, user_id, username)
+                    )
+                    self._health_tasks[connection_key] = health_task
+                    self.logger.debug(f"Cookie 健康检查已启动: {shop_id}-{username}")
+
                 message_task = asyncio.create_task(
                     self._message_loop(websocket, shop_id, user_id, username, queue_name)
                 )
@@ -171,6 +195,8 @@ class LifecycleMixin:
                     tasks = [message_task, stop_task]
                     if heartbeat_task:
                         tasks.append(heartbeat_task)
+                    if health_task:
+                        tasks.append(health_task)
 
                     done, pending = await asyncio.wait(
                         tasks,
@@ -202,6 +228,8 @@ class LifecycleMixin:
                     message_task.cancel()
                     if heartbeat_task:
                         heartbeat_task.cancel()
+                    if health_task:
+                        health_task.cancel()
                     try:
                         await asyncio.wait_for(message_task, timeout=3.0)
                     except (asyncio.CancelledError, asyncio.TimeoutError, asyncio.InvalidStateError):
@@ -209,6 +237,11 @@ class LifecycleMixin:
                     if heartbeat_task:
                         try:
                             await asyncio.wait_for(heartbeat_task, timeout=3.0)
+                        except (asyncio.CancelledError, asyncio.TimeoutError, asyncio.InvalidStateError):
+                            pass
+                    if health_task:
+                        try:
+                            await asyncio.wait_for(health_task, timeout=3.0)
                         except (asyncio.CancelledError, asyncio.TimeoutError, asyncio.InvalidStateError):
                             pass
                     await self._cleanup_resources(f"pdd_{shop_id}")
@@ -257,6 +290,17 @@ class LifecycleMixin:
                     except Exception as e:
                         self.logger.error(f"停止心跳任务时出错: {connection_key}, {e}")
                 del self._heartbeat_tasks[connection_key]
+
+            for connection_key, task in list(self._health_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=3.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        self.logger.debug(f"Cookie健康检查任务已取消或超时: {connection_key}")
+                    except Exception as e:
+                        self.logger.error(f"停止Cookie健康检查任务时出错: {connection_key}, {e}")
+                del self._health_tasks[connection_key]
 
             if self.ws:
                 await self._safe_close_websocket(self.ws)
@@ -316,6 +360,75 @@ class LifecycleMixin:
             if connection_key in self._heartbeat_tasks:
                 del self._heartbeat_tasks[connection_key]
             self.logger.debug(f"心跳循环已结束: {shop_id}-{username}")
+
+    async def _cookie_health_loop(self, shop_id: str, user_id: str, username: str):
+        """Cookie 健康检查循环，定期验证 cookie 有效性并主动刷新"""
+        from Channel.pinduoduo.cookie_utils import check_cookies_valid, perform_relogin
+        from Channel.pinduoduo.cookie_cache import cookie_cache
+
+        connection_key = f"{shop_id}_{user_id}"
+
+        try:
+            while not (self._stop_event and self._stop_event.is_set()):
+                await asyncio.sleep(self.heartbeat_config.cookie_health_check_interval)
+
+                if self._stop_event and self._stop_event.is_set():
+                    break
+
+                # 从共享缓存或 DB 加载当前 cookie
+                cookies = cookie_cache.get("pinduoduo", shop_id, user_id)
+                if not cookies:
+                    account_info = db_manager.get_account("pinduoduo", shop_id, user_id)
+                    if account_info:
+                        cookies_data = account_info.get('cookies')
+                        if isinstance(cookies_data, str):
+                            import json
+                            try:
+                                cookies = json.loads(cookies_data)
+                            except json.JSONDecodeError:
+                                cookies = None
+                        elif isinstance(cookies_data, dict):
+                            cookies = cookies_data
+
+                if not cookies:
+                    self.logger.debug(f"无 cookie 可检查: {shop_id}-{username}")
+                    continue
+
+                # 轻量级 HTTP 验证
+                is_valid = await asyncio.to_thread(
+                    check_cookies_valid,
+                    "pinduoduo", shop_id, user_id, cookies,
+                    self.heartbeat_config.cookie_health_check_timeout,
+                )
+
+                if not is_valid:
+                    self.logger.warning(
+                        f"Cookie 健康检查失败: {shop_id}-{username}，触发主动重登"
+                    )
+                    account_info = db_manager.get_account("pinduoduo", shop_id, user_id)
+                    if account_info:
+                        success = await asyncio.to_thread(
+                            perform_relogin,
+                            "pinduoduo", shop_id, user_id,
+                            account_info.get('username', username),
+                            account_info.get('password', ''),
+                            True,
+                        )
+                        if success:
+                            self.logger.info(f"主动重登成功: {shop_id}-{username}")
+                        else:
+                            self.logger.error(f"主动重登失败: {shop_id}-{username}")
+                else:
+                    self.logger.debug(f"Cookie 健康检查通过: {shop_id}-{username}")
+
+        except asyncio.CancelledError:
+            self.logger.debug(f"Cookie 健康检查循环被取消: {shop_id}-{username}")
+        except Exception as e:
+            self.logger.error(f"Cookie 健康检查循环异常: {shop_id}-{username}, {e}")
+        finally:
+            if connection_key in self._health_tasks:
+                del self._health_tasks[connection_key]
+            self.logger.debug(f"Cookie 健康检查循环已结束: {shop_id}-{username}")
 
     async def _message_loop(self, websocket, shop_id: str, user_id: str, username: str, queue_name: str):
         """消息接收循环"""
@@ -404,6 +517,24 @@ class LifecycleMixin:
         except Exception as e:
             self.logger.error(f"清理心跳任务列表失败: {e}")
 
+    async def _cleanup_health_tasks(self):
+        """清理所有 Cookie 健康检查任务"""
+        try:
+            for connection_key, task in list(self._health_tasks.items()):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.wait_for(task, timeout=3.0)
+                    except (asyncio.CancelledError, asyncio.TimeoutError):
+                        pass
+                    except asyncio.InvalidStateError:
+                        self.logger.debug(f"Cookie健康检查任务在不同的的事件循环中: {connection_key}")
+                    except Exception as e:
+                        self.logger.error(f"清理Cookie健康检查任务失败: {connection_key}, {e}")
+            self._health_tasks.clear()
+        except Exception as e:
+            self.logger.error(f"清理Cookie健康检查任务列表失败: {e}")
+
     async def _cleanup_resources(self, queue_name: str):
         """清理资源"""
         from Message import message_consumer_manager
@@ -412,6 +543,7 @@ class LifecycleMixin:
             await self.cleanup_processing_tasks()
             await self._cleanup_reconnect_tasks()
             await self._cleanup_heartbeat_tasks()
+            await self._cleanup_health_tasks()
             await self.resource_manager.cleanup_all()
 
             try:

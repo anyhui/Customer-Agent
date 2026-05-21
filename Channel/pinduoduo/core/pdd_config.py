@@ -20,6 +20,10 @@ class HeartbeatConfig:
     heartbeat_timeout: float = 10.0    # 心跳超时(秒)
     health_check_interval: float = 60.0 # 健康检查间隔(秒)
     max_heartbeat_failures: int = 3    # 最大心跳失败次数
+    # Cookie 健康检查
+    enable_cookie_health_check: bool = True       # 是否启用主动 cookie 健康检查
+    cookie_health_check_interval: float = 300.0    # cookie 健康检查间隔(秒)，默认5分钟
+    cookie_health_check_timeout: float = 15.0      # cookie 验证 HTTP 请求超时(秒)
 
 
 __all__ = ['ReconnectConfig', 'HeartbeatConfig']
