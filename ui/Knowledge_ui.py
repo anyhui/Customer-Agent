@@ -539,9 +539,9 @@ class KnowledgeUI(QWidget):
 
         # 更新标签下拉框（只有标签变化时才重建，避免卡顿）
         all_tags = tuple(sorted(self.knowledge_service.get_all_tags(self.current_shop_id)))
+        current_selection = self.tag_combo.currentData()
         if all_tags != self._last_cs_tags:
             self._last_cs_tags = all_tags
-            current_selection = self.tag_combo.currentData()
 
             self.tag_combo.blockSignals(True)
             self.tag_combo.clear()
